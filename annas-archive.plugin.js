@@ -68,77 +68,94 @@ async function queryOpenLibrary(path) {
 
 function mapOpenLibraryDocs(docs) {
   if (!Array.isArray(docs)) return [];
-  return docs
-    .map((doc) => {
-      const title = cleanText(doc.title);
-      if (!title) return null;
-      const key = (doc.key || "").replace(/^\/works\//, "");
-      const author = Array.isArray(doc.author_name)
-        ? doc.author_name[0]
-        : typeof doc.author_name === "string"
-          ? doc.author_name
-          : undefined;
-      const isbn = Array.isArray(doc.isbn) ? doc.isbn[0] : undefined;
-      const cover = buildCoverUrl(doc.cover_i || (doc.cover_id ? doc.cover_id : undefined));
-      const ia = Array.isArray(doc.ia) && doc.ia[0] ? doc.ia[0] : undefined;
+  const seen = new Set();
+  const results = [];
 
-      const id =
-        "ol:" +
-        (key || "item") +
-        (isbn ? ":isbn:" + isbn : "") +
-        (ia ? ":ia:" + ia : "") +
-        (author ? ":a:" + encodeURIComponent(author) : "") +
-        ":t:" +
-        encodeURIComponent(title);
+  for (const doc of docs) {
+    const title = cleanText(doc.title);
+    if (!title) continue;
 
-      return {
-        id,
-        title,
-        cover,
-        author,
-        authors: author ? [author] : [],
-        description: doc.first_sentence ? doc.first_sentence[0] : undefined,
-        genres: Array.isArray(doc.subject) ? doc.subject.slice(0, 4) : ["eBook"],
-        isbn,
-        year: typeof doc.first_publish_year === "number" ? doc.first_publish_year : undefined,
-      };
-    })
-    .filter(Boolean);
+    // Filter out foreign language editions when language tags are present
+    if (Array.isArray(doc.language) && doc.language.length > 0 && !doc.language.includes("eng")) {
+      continue;
+    }
+
+    const author = Array.isArray(doc.author_name)
+      ? doc.author_name[0]
+      : typeof doc.author_name === "string"
+        ? doc.author_name
+        : (doc.authors && doc.authors[0]?.name ? doc.authors[0].name : "");
+
+    // Deduplicate by normalized title + author
+    const normKey = (title + "::" + (author || "")).toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (seen.has(normKey)) continue;
+    seen.add(normKey);
+
+    const key = (doc.key || "").replace(/^\/works\//, "");
+    const isbn = Array.isArray(doc.isbn) ? doc.isbn[0] : undefined;
+    const cover = buildCoverUrl(doc.cover_i || (doc.cover_id ? doc.cover_id : undefined));
+
+    const id =
+      "ol:" +
+      (key || "item") +
+      (isbn ? ":isbn:" + isbn : "") +
+      (author ? ":a:" + encodeURIComponent(author) : "") +
+      ":t:" +
+      encodeURIComponent(title);
+
+    results.push({
+      id,
+      title,
+      cover,
+      author: author || undefined,
+      authors: author ? [author] : [],
+      description: doc.first_sentence ? doc.first_sentence[0] : undefined,
+      genres: Array.isArray(doc.subject) ? doc.subject.slice(0, 4) : ["eBook"],
+      isbn,
+      year: typeof doc.first_publish_year === "number" ? doc.first_publish_year : undefined,
+    });
+  }
+
+  return results;
 }
 
-// Automatically sync book to user's TorBox account
+// Automatically sync book torrent to user's TorBox account
 async function syncToTorbox(title, iaId, author) {
   if (!TORBOX_API_KEY || !bridge) return;
   try {
-    let targetIa = iaId;
-    if (!targetIa && title) {
-      const query = author ? title + " " + author : title;
-      const sUrl =
-        "https://archive.org/advancedsearch.php?q=mediatype:texts+AND+(" +
-        encodeURIComponent(query) +
-        ")&fl[]=identifier&rows=3&page=1&output=json";
-      const sRes = await bridge.http(sUrl, {
+    const q = (title + (author ? " " + author : "")).trim();
+    const sRes = await bridge.http("https://apibay.org/q.php?q=" + encodeURIComponent(q + " epub"), {
+      method: "GET",
+      headers: HEADERS,
+      responseType: "json",
+      timeoutMs: 4000,
+    });
+    const sData = sRes?.body || sRes;
+    let top = Array.isArray(sData) && sData[0] && sData[0].id !== "0" ? sData[0] : null;
+
+    if (!top) {
+      const sRes2 = await bridge.http("https://apibay.org/q.php?q=" + encodeURIComponent(q), {
         method: "GET",
         headers: HEADERS,
         responseType: "json",
-        timeoutMs: 5000,
+        timeoutMs: 4000,
       });
-      const sData = sRes?.body || sRes;
-      if (sData?.response?.docs?.[0]?.identifier) {
-        targetIa = sData.response.docs[0].identifier;
+      const sData2 = sRes2?.body || sRes2;
+      if (Array.isArray(sData2) && sData2[0] && sData2[0].id !== "0") {
+        top = sData2[0];
       }
     }
 
-    if (targetIa) {
-      const link = "https://archive.org/details/" + targetIa;
-      await bridge.http("https://api.torbox.app/v1/api/webdl/createwebdownload", {
+    if (top && top.info_hash) {
+      const magnet = "magnet:?xt=urn:btih:" + top.info_hash + "&dn=" + encodeURIComponent(top.name);
+      await bridge.http("https://api.torbox.app/v1/api/torrents/createtorrent", {
         method: "POST",
         headers: {
           Authorization: "Bearer " + TORBOX_API_KEY,
           "Content-Type": "application/x-www-form-urlencoded",
           ...HEADERS,
         },
-        body: "link=" + encodeURIComponent(link),
+        body: "magnet=" + encodeURIComponent(magnet) + "&allow_zipped=true",
         responseType: "json",
         timeoutMs: 8000,
       });
@@ -316,23 +333,29 @@ const plugin = {
       const gUrl = "https://www.gutenberg.org/ebooks/search/?query=" + encodeURIComponent(title);
       const gRes = await bridge.http(gUrl, { method: "GET", headers: HEADERS, responseType: "text" });
       const gHtml = gRes?.body || (typeof gRes === "string" ? gRes : "");
-      const bookMatch = gHtml.match(/\/ebooks\/(\d+)/);
-      if (bookMatch) {
-        const bookGutenId = bookMatch[1];
-        const readUrl = "https://www.gutenberg.org/files/" + bookGutenId + "/" + bookGutenId + "-h/" + bookGutenId + "-h.htm";
-        const readRes = await bridge.http(readUrl, { method: "GET", headers: HEADERS, responseType: "text" });
-        const readHtml = readRes?.body || (typeof readRes === "string" ? readRes : "");
-        if (readHtml && readHtml.length > 1000) {
-          // Parse chapter headings
-          const headingMatches = [...readHtml.matchAll(/<h[23][^>]*>([^<]+)<\/h[23]>/gi)];
-          if (headingMatches.length > 0) {
-            textCache.set(id + "::gutenberg", readHtml);
-            return headingMatches.map((m, idx) => ({
-              id: id + "::gutenberg::" + idx,
-              title: m[1].replace(/\s+/g, " ").trim(),
-              position: idx,
-              language: "en",
-            }));
+      const cardMatch = gHtml.match(
+        /<li class="booklink"[\s\S]*?href="\/ebooks\/(\d+)"[\s\S]*?<span class="title">([^<]+)<\/span>/i
+      );
+      if (cardMatch) {
+        const bookGutenId = cardMatch[1];
+        const gTitle = cardMatch[2].toLowerCase();
+        const reqTitle = title.toLowerCase();
+        if (gTitle.includes(reqTitle) || reqTitle.includes(gTitle)) {
+          const readUrl = "https://www.gutenberg.org/files/" + bookGutenId + "/" + bookGutenId + "-h/" + bookGutenId + "-h.htm";
+          const readRes = await bridge.http(readUrl, { method: "GET", headers: HEADERS, responseType: "text" });
+          const readHtml = readRes?.body || (typeof readRes === "string" ? readRes : "");
+          if (readHtml && readHtml.length > 1000) {
+            // Parse chapter headings
+            const headingMatches = [...readHtml.matchAll(/<h[23][^>]*>([^<]+)<\/h[23]>/gi)];
+            if (headingMatches.length > 0) {
+              textCache.set(id + "::gutenberg", readHtml);
+              return headingMatches.map((m, idx) => ({
+                id: id + "::gutenberg::" + idx,
+                title: m[1].replace(/\s+/g, " ").trim(),
+                position: idx,
+                language: "en",
+              }));
+            }
           }
         }
       }
