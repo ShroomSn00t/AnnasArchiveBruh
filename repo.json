@@ -1,0 +1,15 @@
+{
+  "type": "ebook",
+  "name": "Anna's Archive",
+  "plugins": [
+    {
+      "id": "annas-archive",
+      "name": "Anna's Archive",
+      "version": "1.0.0",
+      "lang": "all",
+      "nsfw": false,
+      "icon": "https://annas-archive.gl/favicon.ico",
+      "entry": "annas-archive.plugin.js"
+    }
+  ]
+}
