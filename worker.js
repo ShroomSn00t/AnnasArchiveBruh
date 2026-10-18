@@ -230,7 +230,10 @@ function parseEpub(entries, bookTitle = "") {
     const bytes = entries.get(ch.path);
     if (bytes) {
       const rawHtml = decoder.decode(bytes);
-      const cleaned = cleanHtmlToProse(rawHtml);
+      let cleaned = cleanHtmlToProse(rawHtml);
+      if (!cleaned || cleaned.length < 5) {
+        cleaned = ch.title + "\n\n[Illustration / Front Matter]";
+      }
       chapterTexts.set(ch.id, cleaned);
       chapterTexts.set(ch.path, cleaned);
     }
@@ -244,6 +247,7 @@ function cleanHtmlToProse(html) {
   return html
     .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "")
     .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, "")
+    .replace(/<img\b[^>]*alt=["']([^"']+)["'][^>]*>/gi, "\n\n[$1]\n\n")
     .replace(/<(?:p|div|h[1-6]|li|blockquote)[^>]*>/gi, "\n\n")
     .replace(/<br\s*\/?>/gi, "\n")
     .replace(/<[^>]+>/g, " ")
@@ -356,6 +360,75 @@ async function findBookTorrent(title, author) {
   };
 }
 
+// Fetch and unpack EPUB directly from TorBox torrent ID in 1 step
+async function fetchEpubFromTorboxId(torrentId) {
+  if (!TORBOX_API_KEY || !torrentId) return null;
+  try {
+    const listRes = await safeFetch(
+      "https://api.torbox.app/v1/api/torrents/mylist?id=" + torrentId,
+      { headers: { Authorization: "Bearer " + TORBOX_API_KEY } },
+      5000
+    );
+    if (!listRes || !listRes.ok) return null;
+    const listData = await listRes.json();
+    const torrentObj = listData?.data;
+    const files = torrentObj?.files || (Array.isArray(torrentObj) ? torrentObj[0]?.files : []) || [];
+    const epubFile =
+      files.find((f) => f.name && f.name.toLowerCase().endsWith(".epub")) ||
+      files.find((f) => f.mimetype === "application/epub+zip") ||
+      files[0];
+    if (!epubFile) return null;
+
+    const dlRes = await safeFetch(
+      "https://api.torbox.app/v1/api/torrents/requestdl?token=" +
+        TORBOX_API_KEY +
+        "&torrent_id=" +
+        torrentId +
+        "&file_id=" +
+        epubFile.id,
+      { headers: HEADERS },
+      5000
+    );
+    if (!dlRes || !dlRes.ok) return null;
+    const dlData = await dlRes.json();
+    const cdnUrl = dlData?.data;
+    if (!cdnUrl) return null;
+
+    const fileRes = await safeFetch(cdnUrl, { headers: HEADERS }, 10000);
+    if (fileRes && fileRes.ok) {
+      const bytes = new Uint8Array(await fileRes.arrayBuffer());
+      if (bytes[0] === 0x50 && bytes[1] === 0x4b) {
+        return { bytes, torrentId, name: torrentObj?.name || "" };
+      }
+    }
+  } catch {}
+  return null;
+}
+
+// Check if a book torrent already exists in user's TorBox account
+async function findEpubInUserTorboxAccount(title) {
+  if (!TORBOX_API_KEY || !title) return null;
+  try {
+    const res = await safeFetch("https://api.torbox.app/v1/api/torrents/mylist", {
+      headers: { Authorization: "Bearer " + TORBOX_API_KEY },
+    }, 4000);
+    if (!res || !res.ok) return null;
+    const data = await res.json();
+    const list = data?.data || [];
+    const norm = title.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (!norm) return null;
+
+    for (const t of list) {
+      const tNorm = (t.name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (tNorm.includes(norm) || norm.includes(tNorm)) {
+        const direct = await fetchEpubFromTorboxId(t.id);
+        if (direct && direct.bytes) return direct;
+      }
+    }
+  } catch {}
+  return null;
+}
+
 // Send torrent magnet to TorBox and retrieve EPUB
 async function fetchEpubViaTorboxTorrent(title, author) {
   if (!TORBOX_API_KEY) return null;
@@ -383,47 +456,7 @@ async function fetchEpubViaTorboxTorrent(title, author) {
     const torrentId = createData?.data?.torrent_id;
     if (!torrentId) return null;
 
-    // Check files in TorBox
-    const listRes = await safeFetch(
-      "https://api.torbox.app/v1/api/torrents/mylist?id=" + torrentId,
-      { headers: { Authorization: "Bearer " + TORBOX_API_KEY } },
-      5000
-    );
-    if (!listRes || !listRes.ok) return null;
-    const listData = await listRes.json();
-    const files = listData?.data?.files || [];
-
-    const epubFile =
-      files.find((f) => f.name.toLowerCase().endsWith(".epub")) ||
-      files.find((f) => f.mimetype === "application/epub+zip") ||
-      files[0];
-
-    if (!epubFile) return null;
-
-    // Request direct download link from TorBox CDN
-    const dlRes = await safeFetch(
-      "https://api.torbox.app/v1/api/torrents/requestdl?token=" +
-        TORBOX_API_KEY +
-        "&torrent_id=" +
-        torrentId +
-        "&file_id=" +
-        epubFile.id,
-      { headers: HEADERS },
-      5000
-    );
-    if (!dlRes || !dlRes.ok) return null;
-    const dlData = await dlRes.json();
-    const cdnUrl = dlData?.data;
-    if (!cdnUrl) return null;
-
-    // Download EPUB from TorBox CDN
-    const fileRes = await safeFetch(cdnUrl, { headers: HEADERS }, 10000);
-    if (fileRes && fileRes.ok) {
-      const bytes = new Uint8Array(await fileRes.arrayBuffer());
-      if (bytes[0] === 0x50 && bytes[1] === 0x4b) {
-        return { bytes, torrentId, name: torrentInfo.name };
-      }
-    }
+    return await fetchEpubFromTorboxId(torrentId);
   } catch (e) {
     // Non-blocking fallback
   }
@@ -579,7 +612,7 @@ async function fetchEpubGutenbergStrict(title) {
 }
 
 // Core Resolver Engine: TorBox Torrent first, then fallback direct mirrors
-async function getOrLoadBook(bookKey, title, author, isbn, iaId) {
+async function getOrLoadBook(bookKey, title, author, isbn, iaId, torrentId) {
   if (bookCache.has(bookKey)) {
     return bookCache.get(bookKey);
   }
@@ -587,14 +620,34 @@ async function getOrLoadBook(bookKey, title, author, isbn, iaId) {
   let epubBytes = null;
   let torrentData = null;
 
-  // 1. Try TorBox Torrent (Primary: Sends real torrent to TorBox, downloads genuine EPUB)
-  const tbTorrentResult = await fetchEpubViaTorboxTorrent(title, author);
-  if (tbTorrentResult && tbTorrentResult.bytes) {
-    epubBytes = tbTorrentResult.bytes;
-    torrentData = tbTorrentResult;
+  // 1. Direct fetch if torrentId is already known (Fastest: ~300ms direct CDN download)
+  if (torrentId && TORBOX_API_KEY) {
+    const directResult = await fetchEpubFromTorboxId(torrentId);
+    if (directResult && directResult.bytes) {
+      epubBytes = directResult.bytes;
+      torrentData = directResult;
+    }
   }
 
-  // 2. Direct Archive.org metadata EPUB download (if TorBox torrent is still downloading metadata)
+  // 2. Check if already in user's TorBox account (avoid re-downloading)
+  if (!epubBytes && TORBOX_API_KEY && title) {
+    const existing = await findEpubInUserTorboxAccount(title);
+    if (existing && existing.bytes) {
+      epubBytes = existing.bytes;
+      torrentData = existing;
+    }
+  }
+
+  // 3. Search torrent index and send to TorBox
+  if (!epubBytes) {
+    const tbTorrentResult = await fetchEpubViaTorboxTorrent(title, author);
+    if (tbTorrentResult && tbTorrentResult.bytes) {
+      epubBytes = tbTorrentResult.bytes;
+      torrentData = tbTorrentResult;
+    }
+  }
+
+  // 4. Direct Archive.org metadata EPUB download
   if (!epubBytes) {
     epubBytes = await fetchDirectIaEpub(iaId, title, author);
   }
@@ -697,6 +750,7 @@ async function handleRequest(request, env, ctx) {
     const author = url.searchParams.get("author") || "";
     const isbn = url.searchParams.get("isbn") || "";
     const iaId = url.searchParams.get("ia") || "";
+    const torrentIdParam = url.searchParams.get("torrentId") || "";
     const bookKey = (isbn || title || q).toLowerCase().replace(/[^a-z0-9]/g, "");
 
     // Send torrent to TorBox in parallel so TorBox gets populated with the real torrent
@@ -715,7 +769,7 @@ async function handleRequest(request, env, ctx) {
     try {
       const [syncResult, bookData] = await Promise.all([
         syncPromise,
-        getOrLoadBook(bookKey, title, author, isbn, iaId),
+        getOrLoadBook(bookKey, title, author, isbn, iaId, torrentIdParam),
       ]);
 
       if (!bookData || !bookData.chapters || bookData.chapters.length === 0) {
@@ -729,13 +783,15 @@ async function handleRequest(request, env, ctx) {
         );
       }
 
+      const torrentId = bookData.torrentData?.torrentId || syncResult?.torrentId || null;
       return new Response(
         JSON.stringify({
           success: true,
           bookKey,
           title: bookData.title || title,
           torboxTorrentSynced: Boolean(syncResult?.success),
-          torrentInfo: syncResult,
+          torrentInfo: syncResult || (bookData.torrentData ? { torrentId: bookData.torrentData.torrentId, name: bookData.torrentData.name } : null),
+          torrentId,
           totalChapters: bookData.chapters.length,
           chapters: bookData.chapters.map((c) => ({
             id: c.id,
@@ -771,33 +827,45 @@ async function handleRequest(request, env, ctx) {
   if (url.pathname === "/api/content") {
     const bookKey = url.searchParams.get("bookKey") || "";
     const chapterId = url.searchParams.get("chapterId") || "1";
+    const title = url.searchParams.get("title") || "";
+    const author = url.searchParams.get("author") || "";
+    const isbn = url.searchParams.get("isbn") || "";
+    const torrentId = url.searchParams.get("torrentId") || "";
 
-    const bookData = bookCache.get(bookKey);
+    let bookData = bookCache.get(bookKey);
     if (!bookData) {
-      const title = url.searchParams.get("title") || bookKey;
-      const author = url.searchParams.get("author") || "";
-      const reloaded = await getOrLoadBook(bookKey, title, author, "", "");
-      if (reloaded && reloaded.chapterTexts.has(chapterId)) {
-        return new Response(reloaded.chapterTexts.get(chapterId), {
+      // Reload on fresh worker isolates using full metadata
+      bookData = await getOrLoadBook(bookKey, title, author, isbn, "", torrentId);
+    }
+
+    if (bookData && bookData.chapterTexts) {
+      const text = bookData.chapterTexts.get(chapterId) || bookData.chapterTexts.get(String(chapterId));
+      if (text && text.trim().length > 0) {
+        return new Response(text.trim(), {
           headers: {
             "Access-Control-Allow-Origin": "*",
             "Content-Type": "text/plain; charset=utf-8",
           },
         });
       }
-
-      return new Response("Chapter text unavailable. Please tap reload.", {
-        status: 404,
-        headers: corsHeaders,
-      });
     }
 
-    const text = bookData.chapterTexts.get(chapterId) || "Chapter content not found.";
-    return new Response(text, {
-      headers: {
-        "Access-Control-Allow-Origin": "*",
-        "Content-Type": "text/plain; charset=utf-8",
-      },
+    // Front matter / cover placeholder fallback (never return 404 to Compass if book was loaded)
+    if (bookData && bookData.chapters) {
+      const ch = bookData.chapters.find((c) => String(c.id) === String(chapterId));
+      if (ch) {
+        return new Response((ch.title || "Chapter") + "\n\n[Illustration / Front Matter]", {
+          headers: {
+            "Access-Control-Allow-Origin": "*",
+            "Content-Type": "text/plain; charset=utf-8",
+          },
+        });
+      }
+    }
+
+    return new Response("Chapter content not found. Please tap reload.", {
+      status: 404,
+      headers: corsHeaders,
     });
   }
 

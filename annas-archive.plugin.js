@@ -316,8 +316,9 @@ const plugin = {
 
         const data = res?.body || res;
         if (data && data.success && Array.isArray(data.chapters) && data.chapters.length > 0) {
+          const tId = data.torrentId || data.torrentInfo?.torrentId || "";
           return data.chapters.map((c) => ({
-            id: id + "::bridge::" + encodeURIComponent(data.bookKey) + "::" + c.id,
+            id: id + "::bridge::" + encodeURIComponent(data.bookKey) + "::" + c.id + (tId ? "::" + tId : ""),
             title: c.title,
             position: c.position,
             language: "en",
@@ -387,23 +388,43 @@ const plugin = {
     if (mode === "bridge" && parts[2] && parts[3]) {
       const bookKey = decodeURIComponent(parts[2]);
       const chId = parts[3];
+      const torrentId = parts[4] || "";
+
+      let title = "";
+      let author = "";
+      let isbn = "";
+      if (bookId.startsWith("ol:")) {
+        const p = bookId.split(":");
+        for (let i = 0; i < p.length; i++) {
+          if (p[i] === "t" && p[i + 1]) title = decodeURIComponent(p[i + 1]);
+          if (p[i] === "a" && p[i + 1]) author = decodeURIComponent(p[i + 1]);
+          if (p[i] === "isbn" && p[i + 1]) isbn = p[i + 1];
+        }
+      }
+
       if (BRIDGE_URL) {
         const cUrl =
           BRIDGE_URL +
           "/api/content?bookKey=" +
           encodeURIComponent(bookKey) +
           "&chapterId=" +
-          encodeURIComponent(chId);
+          encodeURIComponent(chId) +
+          (title ? "&title=" + encodeURIComponent(title) : "") +
+          (author ? "&author=" + encodeURIComponent(author) : "") +
+          (isbn ? "&isbn=" + encodeURIComponent(isbn) : "") +
+          (torrentId ? "&torrentId=" + encodeURIComponent(torrentId) : "");
 
         const res = await bridge.http(cUrl, {
           method: "GET",
           headers: HEADERS,
           responseType: "text",
-          timeoutMs: 15000,
+          timeoutMs: 20000,
         });
 
         const text = res?.body || (typeof res === "string" ? res : "");
-        if (text && text.length > 20) return text;
+        if (typeof text === "string" && text.trim().length > 0 && !text.includes("Chapter content not found")) {
+          return text.trim();
+        }
       }
     }
 
