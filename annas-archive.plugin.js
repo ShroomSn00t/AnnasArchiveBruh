@@ -87,6 +87,7 @@ function mapOpenLibraryDocs(docs) {
         (key || "item") +
         (isbn ? ":isbn:" + isbn : "") +
         (ia ? ":ia:" + ia : "") +
+        (author ? ":a:" + encodeURIComponent(author) : "") +
         ":t:" +
         encodeURIComponent(title);
 
@@ -103,6 +104,48 @@ function mapOpenLibraryDocs(docs) {
       };
     })
     .filter(Boolean);
+}
+
+// Automatically sync book to user's TorBox account
+async function syncToTorbox(title, iaId, author) {
+  if (!TORBOX_API_KEY || !bridge) return;
+  try {
+    let targetIa = iaId;
+    if (!targetIa && title) {
+      const query = author ? title + " " + author : title;
+      const sUrl =
+        "https://archive.org/advancedsearch.php?q=mediatype:texts+AND+(" +
+        encodeURIComponent(query) +
+        ")&fl[]=identifier&rows=3&page=1&output=json";
+      const sRes = await bridge.http(sUrl, {
+        method: "GET",
+        headers: HEADERS,
+        responseType: "json",
+        timeoutMs: 5000,
+      });
+      const sData = sRes?.body || sRes;
+      if (sData?.response?.docs?.[0]?.identifier) {
+        targetIa = sData.response.docs[0].identifier;
+      }
+    }
+
+    if (targetIa) {
+      const link = "https://archive.org/details/" + targetIa;
+      await bridge.http("https://api.torbox.app/v1/api/webdl/createwebdownload", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer " + TORBOX_API_KEY,
+          "Content-Type": "application/x-www-form-urlencoded",
+          ...HEADERS,
+        },
+        body: "link=" + encodeURIComponent(link),
+        responseType: "json",
+        timeoutMs: 8000,
+      });
+    }
+  } catch (e) {
+    // Non-blocking sync
+  }
 }
 
 const plugin = {
@@ -170,6 +213,8 @@ const plugin = {
       const parts = id.split(":");
       for (let i = 0; i < parts.length; i++) {
         if (parts[i] === "isbn" && parts[i + 1]) isbn = parts[i + 1];
+        if (parts[i] === "ia" && parts[i + 1]) iaId = parts[i + 1];
+        if (parts[i] === "a" && parts[i + 1]) author = decodeURIComponent(parts[i + 1]);
         if (parts[i] === "t" && parts[i + 1]) title = decodeURIComponent(parts[i + 1]);
       }
       const workId = parts[1];
@@ -192,6 +237,9 @@ const plugin = {
 
     if (!title) title = cleanText(id);
 
+    // Sync to TorBox in background whenever book details are viewed
+    syncToTorbox(title, iaId, author).catch(() => {});
+
     return {
       id,
       title,
@@ -210,6 +258,7 @@ const plugin = {
 
   async chapters(id) {
     let title = "";
+    let author = "";
     let isbn = "";
     let iaId = "";
 
@@ -218,10 +267,14 @@ const plugin = {
       for (let i = 0; i < parts.length; i++) {
         if (parts[i] === "isbn" && parts[i + 1]) isbn = parts[i + 1];
         if (parts[i] === "ia" && parts[i + 1]) iaId = parts[i + 1];
+        if (parts[i] === "a" && parts[i + 1]) author = decodeURIComponent(parts[i + 1]);
         if (parts[i] === "t" && parts[i + 1]) title = decodeURIComponent(parts[i + 1]);
       }
     }
     if (!title) title = id;
+
+    // Automatically trigger TorBox WebDL so book populates in user's TorBox dashboard
+    syncToTorbox(title, iaId, author).catch(() => {});
 
     // 1. Try Reader Bridge (Cloudflare Worker or Local Node daemon)
     // The Bridge resolves TorBox / Anna's Archive / Libgen in 200ms and returns real chapters!
@@ -233,6 +286,7 @@ const plugin = {
           encodeURIComponent(isbn || title) +
           "&title=" +
           encodeURIComponent(title) +
+          (author ? "&author=" + encodeURIComponent(author) : "") +
           (isbn ? "&isbn=" + encodeURIComponent(isbn) : "") +
           (iaId ? "&ia=" + encodeURIComponent(iaId) : "");
 

@@ -386,8 +386,49 @@ async function getOrLoadBook(bookKey, title, isbn, iaId) {
   return bookData;
 }
 
+// Automatically sync book to user's TorBox account
+async function syncToTorbox(title, iaId, author) {
+  if (!TORBOX_API_KEY) return null;
+  try {
+    let targetIa = iaId;
+    if (!targetIa && title) {
+      const query = author ? title + " " + author : title;
+      const sUrl =
+        "https://archive.org/advancedsearch.php?q=mediatype:texts+AND+(" +
+        encodeURIComponent(query) +
+        ")&fl[]=identifier,title&rows=3&page=1&output=json";
+      const sRes = await safeFetch(sUrl, { headers: HEADERS }, 5000);
+      if (sRes && sRes.ok) {
+        const sData = await sRes.json();
+        if (sData?.response?.docs?.[0]?.identifier) {
+          targetIa = sData.response.docs[0].identifier;
+        }
+      }
+    }
+
+    if (targetIa) {
+      const link = "https://archive.org/details/" + targetIa;
+      const createRes = await safeFetch("https://api.torbox.app/v1/api/webdl/createwebdownload", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer " + TORBOX_API_KEY,
+          "Content-Type": "application/x-www-form-urlencoded",
+          ...HEADERS,
+        },
+        body: "link=" + encodeURIComponent(link),
+      }, 8000);
+      if (createRes && createRes.ok) {
+        return await createRes.json();
+      }
+    }
+  } catch (e) {
+    // Non-blocking sync
+  }
+  return null;
+}
+
 // HTTP Request Handler (compatible with Cloudflare Workers, Vercel, and Node.js)
-async function handleRequest(request) {
+async function handleRequest(request, env, ctx) {
   const url = new URL(request.url);
   const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
@@ -417,9 +458,16 @@ async function handleRequest(request) {
   if (url.pathname === "/api/chapters") {
     const q = url.searchParams.get("q") || "";
     const title = url.searchParams.get("title") || q;
+    const author = url.searchParams.get("author") || "";
     const isbn = url.searchParams.get("isbn") || "";
     const iaId = url.searchParams.get("ia") || "";
     const bookKey = (isbn || title || q).toLowerCase().replace(/[^a-z0-9]/g, "");
+
+    // Automatically trigger TorBox WebDL so book populates in user's TorBox dashboard
+    const syncPromise = TORBOX_API_KEY ? syncToTorbox(title, iaId, author) : null;
+    if (ctx && typeof ctx.waitUntil === "function" && syncPromise) {
+      ctx.waitUntil(syncPromise);
+    }
 
     if (!bookKey) {
       return new Response(JSON.stringify({ error: "Missing book query" }), {
@@ -429,12 +477,17 @@ async function handleRequest(request) {
     }
 
     try {
-      const bookData = await getOrLoadBook(bookKey, title, isbn, iaId);
+      const [syncResult, bookData] = await Promise.all([
+        syncPromise,
+        getOrLoadBook(bookKey, title, isbn, iaId),
+      ]);
+
       if (!bookData || !bookData.chapters || bookData.chapters.length === 0) {
         return new Response(
           JSON.stringify({
             error: "Book not found or could not be decrypted",
             chapters: [],
+            torbox: syncResult,
           }),
           { status: 404, headers: corsHeaders }
         );
@@ -445,6 +498,7 @@ async function handleRequest(request) {
           success: true,
           bookKey,
           title: bookData.title || title,
+          torboxSynced: Boolean(syncResult?.success),
           totalChapters: bookData.chapters.length,
           chapters: bookData.chapters.map((c) => ({
             id: c.id,
@@ -460,6 +514,22 @@ async function handleRequest(request) {
         headers: corsHeaders,
       });
     }
+  }
+
+  // 3. Manual TorBox sync endpoint: /api/sync-torbox?title=...&author=...
+  if (url.pathname === "/api/sync-torbox") {
+    const title = url.searchParams.get("title") || "";
+    const author = url.searchParams.get("author") || "";
+    const iaId = url.searchParams.get("ia") || "";
+    const syncResult = await syncToTorbox(title, iaId, author);
+    return new Response(
+      JSON.stringify({
+        success: Boolean(syncResult?.success),
+        detail: syncResult?.detail,
+        data: syncResult?.data,
+      }),
+      { headers: corsHeaders }
+    );
   }
 
   // 3. Content endpoint: /api/content?bookKey=...&chapterId=...
@@ -501,7 +571,9 @@ async function handleRequest(request) {
 
 // Export for Cloudflare Workers / Vercel
 export default {
-  fetch: handleRequest,
+  async fetch(request, env, ctx) {
+    return handleRequest(request, env, ctx);
+  },
 };
 
 // Also support running directly in Node.js
