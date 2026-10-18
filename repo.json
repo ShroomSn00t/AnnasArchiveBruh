@@ -4,8 +4,8 @@
   "plugins": [
     {
       "id": "annas-archive",
-      "name": "Anna's Archive (TorBox)",
-      "version": "1.1.0",
+      "name": "Anna's Archive (1-Click TorBox Reader)",
+      "version": "1.2.0",
       "lang": "en",
       "nsfw": false,
       "icon": "https://raw.githubusercontent.com/ShroomSn00t/AnnasArchiveBruh/main/icon.png",
