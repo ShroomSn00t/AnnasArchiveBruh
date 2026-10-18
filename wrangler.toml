@@ -1,0 +1,6 @@
+name = "annas-archive-reader-bridge"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[vars]
+TORBOX_API_KEY = "265cd0c5-9953-4505-b9cc-0fc071c58b67"
