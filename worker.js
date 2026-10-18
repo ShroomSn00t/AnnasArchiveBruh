@@ -105,144 +105,122 @@ function parseEpub(entries, bookTitle = "") {
 
   // Manifest ID -> href
   const manifest = new Map();
-  const itemRegex = /<item\s+[^>]*id=["']([^"']+)["'][^>]*href=["']([^"']+)["'][^>]*>/gi;
+  const itemRegex = /<item\b([^>]+)>/gi;
   let itemMatch;
   while ((itemMatch = itemRegex.exec(opfXml)) !== null) {
-    manifest.set(itemMatch[1], itemMatch[2]);
-  }
-  const itemRegex2 = /<item\s+[^>]*href=["']([^"']+)["'][^>]*id=["']([^"']+)["'][^>]*>/gi;
-  while ((itemMatch = itemRegex2.exec(opfXml)) !== null) {
-    manifest.set(itemMatch[2], itemMatch[1]);
+    const attrs = itemMatch[1];
+    const idMatch = attrs.match(/\bid=["']([^"']+)["']/i);
+    const hrefMatch = attrs.match(/\bhref=["']([^"']+)["']/i);
+    if (idMatch && hrefMatch) {
+      manifest.set(idMatch[1], hrefMatch[1]);
+    }
   }
 
   // Spine reading order
   const spine = [];
-  const spineRegex = /<itemref\s+[^>]*idref=["']([^"']+)["'][^>]*>/gi;
+  const spineRegex = /<itemref\b([^>]+)>/gi;
   let spineMatch;
   while ((spineMatch = spineRegex.exec(opfXml)) !== null) {
-    const idref = spineMatch[1];
-    const href = manifest.get(idref);
-    if (href) {
-      const cleanHref = href.split("#")[0];
-      const fullPath = opfDir + cleanHref;
-      spine.push({ idref, path: fullPath });
+    const attrs = spineMatch[1];
+    const idrefMatch = attrs.match(/\bidref=["']([^"']+)["']/i);
+    if (idrefMatch) {
+      const idref = idrefMatch[1];
+      const href = manifest.get(idref);
+      if (href) {
+        const cleanHref = href.split("#")[0];
+        const fullPath = opfDir + cleanHref;
+        spine.push({ idref, path: fullPath, href: cleanHref });
+      }
     }
   }
 
   // Chapter titles from NCX and EPUB3 Nav
   const titles = new Map();
 
-  // 1. Check NCX
+  // 1. Check NCX table of contents
   for (const [key, bytes] of entries.entries()) {
     if (key.endsWith(".ncx")) {
       const ncxXml = decoder.decode(bytes);
-      const navPointRegex =
-        /<navPoint[^>]*>[\s\S]*?<text>([^<]+)<\/text>[\s\S]*?<content\s+[^>]*src=["']([^"']+)["']/gi;
-      let npMatch;
-      while ((npMatch = navPointRegex.exec(ncxXml)) !== null) {
-        const title = npMatch[1].trim();
-        const src = npMatch[2].split("#")[0];
-        const fullSrc = opfDir + src;
-        titles.set(fullSrc, title);
-        titles.set(decodeURIComponent(fullSrc), title);
-        titles.set(src.split("/").pop(), title);
-        titles.set(decodeURIComponent(src.split("/").pop()), title);
-      }
-      // Also try content before text in NCX
-      const navPointRegex2 =
-        /<navPoint[^>]*>[\s\S]*?<content\s+[^>]*src=["']([^"']+)["'][\s\S]*?<text>([^<]+)<\/text>/gi;
-      while ((npMatch = navPointRegex2.exec(ncxXml)) !== null) {
-        const src = npMatch[1].split("#")[0];
-        const title = npMatch[2].trim();
-        const fullSrc = opfDir + src;
-        titles.set(fullSrc, title);
-        titles.set(decodeURIComponent(fullSrc), title);
-        titles.set(src.split("/").pop(), title);
-        titles.set(decodeURIComponent(src.split("/").pop()), title);
+      // Strictly isolate each <navPoint> block so regex never bleeds into adjacent navPoints
+      const npRegex = /<navPoint\b[^>]*>([\s\S]*?)(?:<navPoint\b|<\/navPoint>|$)/gi;
+      let m;
+      while ((m = npRegex.exec(ncxXml)) !== null) {
+        const block = m[1];
+        const textMatch = block.match(/<text\b[^>]*>([\s\S]*?)<\/text>/i);
+        const srcMatch = block.match(/<content\b[^>]*src=["']([^"']+)["']/i);
+        if (textMatch && srcMatch) {
+          const rawTitle = textMatch[1].replace(/<[^>]+>/g, "").trim();
+          const src = srcMatch[1].split("#")[0].trim();
+          const baseName = src.split("/").pop();
+          const fullSrc = opfDir + src;
+
+          if (!titles.has(fullSrc)) titles.set(fullSrc, rawTitle);
+          if (!titles.has(src)) titles.set(src, rawTitle);
+          if (!titles.has(baseName)) titles.set(baseName, rawTitle);
+          if (!titles.has(decodeURIComponent(baseName))) titles.set(decodeURIComponent(baseName), rawTitle);
+        }
       }
     }
 
     // 2. Check EPUB3 nav.xhtml / toc.xhtml
     if (key.endsWith("nav.xhtml") || key.endsWith("toc.xhtml") || key.endsWith("toc.html")) {
       const navHtml = decoder.decode(bytes);
-      const aRegex = /<a\s+[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+      const aRegex = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
       let aMatch;
       while ((aMatch = aRegex.exec(navHtml)) !== null) {
-        const src = aMatch[1].split("#")[0];
-        const title = cleanText(aMatch[2].replace(/<[^>]+>/g, " "));
-        if (title && src) {
+        const src = aMatch[1].split("#")[0].trim();
+        const rawTitle = aMatch[2].replace(/<[^>]+>/g, "").trim();
+        if (rawTitle && src) {
+          const baseName = src.split("/").pop();
           const fullSrc = opfDir + src;
-          titles.set(fullSrc, title);
-          titles.set(decodeURIComponent(fullSrc), title);
-          titles.set(src.split("/").pop(), title);
-          titles.set(decodeURIComponent(src.split("/").pop()), title);
+          if (!titles.has(fullSrc)) titles.set(fullSrc, rawTitle);
+          if (!titles.has(src)) titles.set(src, rawTitle);
+          if (!titles.has(baseName)) titles.set(baseName, rawTitle);
+          if (!titles.has(decodeURIComponent(baseName))) titles.set(decodeURIComponent(baseName), rawTitle);
         }
       }
     }
   }
 
-  // Map spine items to chapters
-  const rawChapters = spine.map((item, index) => {
+  // Map spine items to chapters in exact sequential order
+  const chapters = spine.map((item, index) => {
     const baseName = item.path.split("/").pop();
     let title =
       titles.get(item.path) ||
       titles.get(decodeURIComponent(item.path)) ||
+      titles.get(item.href) ||
       titles.get(baseName) ||
-      titles.get(decodeURIComponent(baseName));
+      titles.get(decodeURIComponent(baseName)) ||
+      "";
 
     if (!title) {
       const fileBytes = entries.get(item.path);
       if (fileBytes) {
         const hText = decoder.decode(fileBytes.subarray(0, 4000));
-        // Only check h1-h4 headings inside body - NEVER use HTML head <title> tag as it is always the book name!
+        // Only check h1-h3 headings inside body
         const hm =
-          hText.match(/<h[1-4][^>]*>([\s\S]*?)<\/h[1-4]>/i) ||
+          hText.match(/<h[1-3][^>]*>([\s\S]*?)<\/h[1-3]>/i) ||
           hText.match(/<p\s+[^>]*class=["'][^"']*(?:chapter|title|heading|subhead)[^"']*["'][^>]*>([\s\S]*?)<\/p>/i);
         if (hm) {
-          title = cleanText(hm[1].replace(/<[^>]+>/g, " "));
+          title = hm[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
         }
       }
     }
 
-    return {
-      id: String(index + 1),
-      title: title || "",
-      position: index,
-      path: item.path,
-    };
-  });
-
-  // Post-process chapter titles: Deduplicate and normalize
-  const titleCounts = new Map();
-  for (const ch of rawChapters) {
-    if (ch.title) {
-      titleCounts.set(ch.title, (titleCounts.get(ch.title) || 0) + 1);
-    }
-  }
-
-  const cleanBookTitle = (bookTitle || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-
-  const chapters = rawChapters.map((ch, index) => {
-    let t = ch.title.trim();
-    const cleanT = t.toLowerCase().replace(/[^a-z0-9]/g, "");
-
-    // If title is identical to book title or repeated across 2+ chapters, replace with numbered chapter
-    const isRepeated = titleCounts.get(t) > 2;
-    const isBookTitle = cleanBookTitle && cleanT.includes(cleanBookTitle);
-
-    if (!t || isRepeated || isBookTitle || t.toLowerCase().includes("untitled")) {
+    let t = (title || "").trim();
+    if (!t || t.toLowerCase() === "untitled") {
       if (index === 0) {
-        t = "Start";
+        t = "Cover";
       } else {
         t = "Chapter " + index;
       }
     }
 
     return {
-      id: ch.id,
+      id: String(index + 1),
       title: t,
-      position: ch.position,
-      path: ch.path,
+      position: index,
+      path: item.path,
     };
   });
 
