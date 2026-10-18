@@ -4,11 +4,11 @@
   "plugins": [
     {
       "id": "annas-archive",
-      "name": "Anna's Archive",
-      "version": "1.0.0",
-      "lang": "all",
+      "name": "Anna's Archive (TorBox)",
+      "version": "1.1.0",
+      "lang": "en",
       "nsfw": false,
-      "icon": "https://annas-archive.gl/favicon.ico",
+      "icon": "https://raw.githubusercontent.com/ShroomSn00t/AnnasArchiveBruh/main/icon.png",
       "entry": "annas-archive.plugin.js"
     }
   ]

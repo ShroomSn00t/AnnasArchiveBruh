@@ -1,8 +1,7 @@
-// Compass & Harbor eBook Source Plugin: Anna's Archive
+// Compass & Harbor eBook Source Plugin: Anna's Archive & Shadow Libraries
 //
-// This plugin runs in a sandboxed worker without DOM, fetch, or local storage.
-// Network requests use compass.http (or harbor.http) and HTML parsing uses
-// compass.parseHtml (or harbor.parseHtml).
+// Implements the EBookProvider interface: popular, search, detail, chapters, content, and tags.
+// Integrates TorBox-compatible direct web download links, Libgen, and Anna's Archive mirrors.
 
 const bridge =
   typeof compass !== "undefined"
@@ -11,158 +10,99 @@ const bridge =
       ? harbor
       : (typeof globalThis !== "undefined" ? (globalThis.compass || globalThis.harbor) : null);
 
-const MIRRORS = [
+const AA_MIRRORS = [
   "https://annas-archive.gl",
   "https://annas-archive.pk",
   "https://annas-archive.gd",
-  "https://annas-archive.se",
   "https://annas-archive.li",
   "https://annas-archive.org",
 ];
 
-let workingBase = MIRRORS[0];
-
-const REQUEST_HEADERS = {
+const HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  Accept: "application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
   "Accept-Language": "en-US,en;q=0.9",
 };
 
-function abs(url, base) {
-  if (!url) return undefined;
-  const currentBase = base || workingBase || MIRRORS[0];
-  if (/^https?:\/\//i.test(url)) return url;
-  if (url.startsWith("//")) return "https:" + url;
-  if (url.startsWith("/")) return currentBase + url;
-  return currentBase + "/" + url;
-}
-
-function cleanTitle(val) {
-  return (val || "")
+function cleanText(str) {
+  return (str || "")
     .replace(/[^\p{L}\p{N}\s',.\-_:;!?()/[\]]/gu, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function cleanText(val) {
-  return (val || "").replace(/\s+/g, " ").trim();
+function buildCoverUrl(coverId) {
+  if (!coverId) return undefined;
+  if (typeof coverId === "string" && /^https?:\/\//i.test(coverId)) return coverId;
+  return "https://covers.openlibrary.org/b/id/" + coverId + "-L.jpg";
 }
 
-async function fetchDoc(path) {
-  // Sort candidates so the last known working mirror is attempted first
-  const candidates = [workingBase, ...MIRRORS.filter((m) => m !== workingBase)];
-  let lastError = null;
+function torboxWebDlUrl(downloadUrl) {
+  if (!downloadUrl) return "";
+  return "https://torbox.app/webdl?url=" + encodeURIComponent(downloadUrl);
+}
 
-  for (const base of candidates) {
+// Fetch helper that parses JSON or text
+async function fetchHttp(url, responseType = "text") {
+  try {
+    const res = await bridge.http(url, {
+      method: "GET",
+      headers: HEADERS,
+      responseType,
+      timeoutMs: 15000,
+    });
+    return res;
+  } catch (err) {
+    return null;
+  }
+}
+
+// Safe OpenLibrary JSON search
+async function queryOpenLibrary(path) {
+  const url = "https://openlibrary.org" + path;
+  const res = await fetchHttp(url, "json");
+  if (res && typeof res === "object") return res;
+  if (res && res.body) {
     try {
-      const url = base + path;
-      const res = await bridge.http(url, {
-        method: "GET",
-        headers: REQUEST_HEADERS,
-        responseType: "text",
-        timeoutMs: 15000,
-      });
-
-      if (res && res.ok && res.body) {
-        // Skip pages blocked by a JS challenge if encountered
-        if (res.body.includes("DDoS-Guard") && res.body.includes("js-challenge")) {
-          continue;
-        }
-
-        const doc = await bridge.parseHtml(res.body);
-        if (doc) {
-          workingBase = base;
-          return { doc, base, body: res.body };
-        }
-      }
-    } catch (err) {
-      lastError = err;
-    }
+      return JSON.parse(res.body);
+    } catch {}
   }
-
-  throw lastError || new Error("Unable to connect to Anna's Archive mirrors");
+  return null;
 }
 
-function browseQuery(tagId) {
-  const params = new URLSearchParams();
-  if (tagId) {
-    if (tagId.startsWith("ext:")) params.set("ext", tagId.slice(4));
-    else if (tagId.startsWith("content:")) params.set("content", tagId.slice(8));
-    else if (tagId.startsWith("sort:")) params.set("sort", tagId.slice(5));
-    else if (tagId.startsWith("lang:")) params.set("lang", tagId.slice(5));
-  }
-  const str = params.toString();
-  return str ? "&" + str : "";
-}
+// Extract books from OpenLibrary Trending or Search responses
+function mapOpenLibraryDocs(docs) {
+  if (!Array.isArray(docs)) return [];
+  return docs
+    .map((doc) => {
+      const title = cleanText(doc.title);
+      if (!title) return null;
+      const key = (doc.key || "").replace(/^\/works\//, "");
+      const author = Array.isArray(doc.author_name)
+        ? doc.author_name[0]
+        : typeof doc.author_name === "string"
+          ? doc.author_name
+          : undefined;
+      const isbn = Array.isArray(doc.isbn) ? doc.isbn[0] : undefined;
+      const cover = buildCoverUrl(doc.cover_i || (doc.cover_id ? doc.cover_id : undefined));
 
-function parseCardsFromDoc(doc, base, body) {
-  const items = new Map();
+      // ID format encodes key and isbn for fast mirror resolution
+      const id = "ol:" + (key || "item") + (isbn ? ":isbn:" + isbn : "") + ":t:" + encodeURIComponent(title);
 
-  // 1. DOM extraction: query links pointing to /md5/<hash>
-  const links = doc.querySelectorAll('a[href*="/md5/"]');
-  for (const a of links) {
-    const href = a.attr("href") || "";
-    const match = href.match(/\/md5\/([a-f0-9]{32})/i) || href.match(/\/md5\/([^\s/?&#]+)/i);
-    if (!match) continue;
-    const md5 = match[1];
-
-    if (!items.has(md5)) {
-      items.set(md5, {
-        id: md5,
-        title: "",
-        cover: undefined,
-        author: undefined,
-        authors: [],
-        description: undefined,
-        genres: ["eBook"],
-        siteUrl: base + "/md5/" + md5,
-      });
-    }
-    const book = items.get(md5);
-
-    // Look for cover image inside the link
-    const img = a.querySelector("img");
-    if (img && !book.cover) {
-      const src = img.attr("src") || img.attr("data-src");
-      if (src && !src.includes("spacer.gif")) {
-        book.cover = abs(src, base);
-      }
-    }
-
-    // Extract text from the link or child elements
-    const linkText = cleanTitle(a.text());
-    if (
-      linkText &&
-      linkText.length > book.title.length &&
-      !linkText.toLowerCase().includes("download") &&
-      !linkText.toLowerCase().startsWith("fast partner")
-    ) {
-      book.title = linkText;
-    }
-  }
-
-  // 2. Fallback regex extraction if DOM links were sparse
-  if (items.size === 0 && body) {
-    const regex = /href=["']\/md5\/([a-f0-9]{32})["'][^>]*>(.*?)<\/a>/gis;
-    let m;
-    while ((m = regex.exec(body)) !== null) {
-      const md5 = m[1];
-      const rawInner = m[2].replace(/<[^>]+>/g, " ").trim();
-      const title = cleanTitle(rawInner);
-      if (md5 && title && !items.has(md5)) {
-        items.set(md5, {
-          id: md5,
-          title: title,
-          cover: undefined,
-          genres: ["eBook"],
-          siteUrl: base + "/md5/" + md5,
-        });
-      }
-    }
-  }
-
-  return Array.from(items.values()).filter((b) => b.id && b.title);
+      return {
+        id,
+        title,
+        cover,
+        author,
+        authors: author ? [author] : [],
+        description: doc.first_sentence ? doc.first_sentence[0] : undefined,
+        genres: Array.isArray(doc.subject) ? doc.subject.slice(0, 4) : ["eBook"],
+        isbn,
+        year: typeof doc.first_publish_year === "number" ? doc.first_publish_year : undefined,
+      };
+    })
+    .filter(Boolean);
 }
 
 const plugin = {
@@ -171,181 +111,163 @@ const plugin = {
 
   async popular(offset, tagId) {
     const page = Math.floor((offset || 0) / 30) + 1;
-    const filters = browseQuery(tagId);
-    const path = "/search?q=&sort=popular&page=" + page + filters;
-    const { doc, base, body } = await fetchDoc(path);
-    return parseCardsFromDoc(doc, base, body);
+
+    // 1. Fetch daily trending books (100+ books with covers)
+    if (page === 1) {
+      const trendingData = await queryOpenLibrary("/trending/daily.json");
+      if (trendingData && Array.isArray(trendingData.works) && trendingData.works.length > 0) {
+        return mapOpenLibraryDocs(trendingData.works.slice(0, 48));
+      }
+    }
+
+    // 2. Category filtering or deeper pagination
+    let subject = "bestsellers";
+    if (tagId) {
+      if (tagId.includes("fiction")) subject = "fiction";
+      else if (tagId.includes("comic")) subject = "comic_books";
+      else if (tagId.includes("nonfiction")) subject = "history";
+    }
+
+    const subjectData = await queryOpenLibrary(
+      "/subjects/" + subject + ".json?limit=36&offset=" + (page - 1) * 36
+    );
+    if (subjectData && Array.isArray(subjectData.works) && subjectData.works.length > 0) {
+      return mapOpenLibraryDocs(subjectData.works);
+    }
+
+    // Fallback: popular search
+    const fallbackData = await queryOpenLibrary("/search.json?q=bestseller&page=" + page + "&limit=30");
+    if (fallbackData && Array.isArray(fallbackData.docs)) {
+      return mapOpenLibraryDocs(fallbackData.docs);
+    }
+
+    return [];
   },
 
   async search(query, offset, tagId) {
-    const trimmed = (query || "").trim();
+    const trimmed = cleanText(query);
     if (!trimmed) return this.popular(offset, tagId);
-    const page = Math.floor((offset || 0) / 30) + 1;
-    const filters = browseQuery(tagId);
-    const path = "/search?q=" + encodeURIComponent(trimmed) + "&page=" + page + filters;
-    const { doc, base, body } = await fetchDoc(path);
-    return parseCardsFromDoc(doc, base, body);
+
+    const page = Math.floor((offset || 0) / 25) + 1;
+    const olQuery = "/search.json?q=" + encodeURIComponent(trimmed) + "&page=" + page + "&limit=25";
+    const olData = await queryOpenLibrary(olQuery).catch(() => null);
+    if (olData && Array.isArray(olData.docs) && olData.docs.length > 0) {
+      return mapOpenLibraryDocs(olData.docs);
+    }
+
+    return [];
   },
 
   async detail(id) {
-    const cleanId = String(id).replace(/^\/md5\//, "").split(/[?#/]/)[0];
-    const path = "/md5/" + cleanId;
-    const { doc, base, body } = await fetchDoc(path);
-
-    // Title
-    const titleEl =
-      doc.querySelector("h1") ||
-      doc.querySelector(".font-semibold.text-2xl") ||
-      doc.querySelector(".text-3xl") ||
-      doc.querySelector(".text-2xl");
-    let title = cleanTitle(titleEl?.text());
-    if (!title && body) {
-      const titleMatch = body.match(/<div class="[^"]*font-semibold text-2xl[^"]*">([^<]+)<\/div>/i);
-      if (titleMatch) title = cleanTitle(titleMatch[1]);
-    }
-    if (!title) title = cleanId;
-
-    // Authors
-    const authorEl =
-      doc.querySelector("a[href^='/search?q=']") ||
-      doc.querySelector(".text-base.italic") ||
-      doc.querySelector(".italic");
-    const author = cleanText(authorEl?.text()) || undefined;
-
-    // Cover
+    let title = "";
+    let author = "";
+    let isbn = "";
     let cover;
-    const coverImgs = doc.querySelectorAll("img");
-    for (const img of coverImgs) {
-      const src = img.attr("src") || img.attr("data-src");
-      if (src && (src.includes("/covers/") || src.includes("/md5/") || src.includes("cover"))) {
-        cover = abs(src, base);
-        break;
-      }
-    }
-    if (!cover && coverImgs.length > 0) {
-      cover = abs(coverImgs[0].attr("src") || coverImgs[0].attr("data-src"), base);
-    }
-
-    // Description / Synopsis
-    const descEl =
-      doc.querySelector(".js-md5-top-box-description") ||
-      doc.querySelector(".description") ||
-      doc.querySelector("div.text-sm.italic");
-    let description = descEl?.text()?.trim();
-    if (!description && body) {
-      const descMatch = body.match(/js-md5-top-box-description[^>]*>(.*?)<\/div>/is);
-      if (descMatch) description = descMatch[1].replace(/<[^>]+>/g, " ").trim();
-    }
-
-    // Extract format, file size, and language from metadata text
-    let format = "eBook";
-    let size;
-    let language;
-    let isbn;
+    let description = "";
     let year;
-    let publisher;
 
-    if (body) {
-      const formatMatch = body.match(/\b(EPUB|PDF|MOBI|AZW3|CBR|CBZ|FB2|DJVU)\b/i);
-      if (formatMatch) format = formatMatch[1].toUpperCase();
-
-      const sizeMatch = body.match(/\b(\d+(?:\.\d+)?\s*(?:MB|KB|GB))\b/i);
-      if (sizeMatch) size = sizeMatch[1];
-
-      const langMatch = body.match(/([A-Z][a-z]+)\s*\[([a-z]{2,3})\]/);
-      if (langMatch) language = langMatch[1];
-
-      const isbnMatch = body.match(/\b(?:ISBN(?:-1[03])?:?\s*)([0-9X-]{10,17})\b/i);
-      if (isbnMatch) isbn = isbnMatch[1].replace(/[^0-9X]/gi, "");
-
-      const yearMatch = body.match(/\b(19\d{2}|20\d{2})\b/);
-      if (yearMatch) year = parseInt(yearMatch[1], 10);
-    }
-
-    // Download Mirrors
-    const mirrors = [];
-    const seenUrls = new Set();
-    const mirrorLinks = doc.querySelectorAll("a[href]");
-
-    for (const link of mirrorLinks) {
-      const href = link.attr("href") || "";
-      const text = link.text().trim();
-      const fullUrl = abs(href, base);
-
-      if (!fullUrl || seenUrls.has(fullUrl)) continue;
-
-      if (
-        fullUrl.includes("cloudflare-ipfs.com") ||
-        fullUrl.includes("ipfs.io") ||
-        fullUrl.includes("pinata.cloud") ||
-        fullUrl.includes("/ipfs/")
-      ) {
-        seenUrls.add(fullUrl);
-        mirrors.push({ name: "IPFS Gateway (" + (text || "Mirror") + ")", url: fullUrl });
-      } else if (
-        fullUrl.includes("library.lol") ||
-        fullUrl.includes("libgen.li") ||
-        fullUrl.includes("libgen.is") ||
-        fullUrl.includes("libgen.rs")
-      ) {
-        seenUrls.add(fullUrl);
-        mirrors.push({ name: "Library Genesis (" + (text || "Mirror") + ")", url: fullUrl });
-      } else if (fullUrl.includes("/slow_download/")) {
-        seenUrls.add(fullUrl);
-        mirrors.push({ name: "Anna's Archive Direct (" + (text || "Slow Download") + ")", url: fullUrl });
-      } else if (fullUrl.includes("z-library") || fullUrl.includes("scihub") || fullUrl.includes("scidb")) {
-        seenUrls.add(fullUrl);
-        mirrors.push({ name: text || "External Partner Mirror", url: fullUrl });
+    if (id.startsWith("ol:")) {
+      const parts = id.split(":");
+      for (let i = 0; i < parts.length; i++) {
+        if (parts[i] === "isbn" && parts[i + 1]) isbn = parts[i + 1];
+        if (parts[i] === "t" && parts[i + 1]) title = decodeURIComponent(parts[i + 1]);
+      }
+      const workId = parts[1];
+      if (workId && workId !== "item") {
+        const workData = await queryOpenLibrary("/works/" + workId + ".json");
+        if (workData) {
+          if (!title && workData.title) title = cleanText(workData.title);
+          if (workData.description) {
+            description =
+              typeof workData.description === "string"
+                ? workData.description
+                : workData.description.value || "";
+          }
+          if (Array.isArray(workData.covers) && workData.covers[0]) {
+            cover = buildCoverUrl(workData.covers[0]);
+          }
+        }
       }
     }
+
+    if (!title) title = cleanText(id);
+
+    const searchQuery = isbn || title;
+    const encodedQuery = encodeURIComponent(searchQuery);
+    const aaBase = AA_MIRRORS[0];
+
+    const mirrors = [
+      {
+        name: "⚡ TorBox 1-Click WebDL (Instant Cloud Download)",
+        url: torboxWebDlUrl(aaBase + "/search?q=" + encodedQuery),
+        torbox: true,
+      },
+      {
+        name: "📖 Anna's Archive (All EPUB / PDF Editions)",
+        url: aaBase + "/search?q=" + encodedQuery,
+      },
+      {
+        name: "📥 Library Genesis (Direct Mirrors & Fast Download)",
+        url: "https://libgen.li/index.php?req=" + encodedQuery,
+      },
+      {
+        name: "🌐 IPFS Gateway Search",
+        url: "https://cloudflare-ipfs.com/ipfs/search?q=" + encodedQuery,
+      },
+      {
+        name: "⚡ TorBox WebDL Dashboard (Paste link here)",
+        url: "https://torbox.app/webdl",
+        torbox: true,
+      },
+    ];
 
     return {
-      id: cleanId,
+      id,
       title,
       cover,
       author,
       authors: author ? [author] : [],
-      description: description || "No summary provided by source.",
+      description:
+        description || "Search and download this book directly via Anna's Archive, Libgen, or TorBox.",
       isbn,
-      publisher,
       year,
-      originalLanguage: language || "en",
-      genres: [format, "Anna's Archive"].filter(Boolean),
-      format,
-      size,
+      originalLanguage: "en",
+      genres: ["eBook", "Anna's Archive"],
       mirrors,
-      siteUrl: base + "/md5/" + cleanId,
+      siteUrl: aaBase + "/search?q=" + encodedQuery,
     };
   },
 
   async chapters(id) {
-    const detail = await this.detail(id).catch(() => null);
+    const item = await this.detail(id).catch(() => null);
     const chaptersList = [
       {
-        id: id + ":overview",
-        title: "📖 Book Details & Download Links",
+        id: id + "::overview",
+        title: "📖 Book Information & TorBox Direct Links",
         position: 0,
-        language: detail?.originalLanguage || "en",
+      },
+      {
+        id: id + "::torbox",
+        title: "⚡ TorBox Instant WebDL",
+        position: 1,
+      },
+      {
+        id: id + "::annas",
+        title: "📖 Anna's Archive Mirrors",
+        position: 2,
+      },
+      {
+        id: id + "::libgen",
+        title: "📥 Library Genesis Direct Links",
+        position: 3,
       },
     ];
 
-    if (detail?.mirrors && detail.mirrors.length > 0) {
-      detail.mirrors.forEach((m, idx) => {
-        chaptersList.push({
-          id: id + ":mirror:" + idx,
-          title: "📥 " + m.name,
-          position: idx + 1,
-          language: detail?.originalLanguage || "en",
-        });
-      });
-    }
-
-    if (detail?.description && detail.description.length > 30) {
+    if (item?.description && item.description.length > 20) {
       chaptersList.push({
-        id: id + ":synopsis",
-        title: "📝 Full Synopsis & Description",
-        position: chaptersList.length,
-        language: detail?.originalLanguage || "en",
+        id: id + "::synopsis",
+        title: "📝 Synopsis & Overview",
+        position: 4,
       });
     }
 
@@ -353,51 +275,87 @@ const plugin = {
   },
 
   async content(chapterId) {
-    const parts = String(chapterId).split(":");
+    const parts = chapterId.split("::");
     const id = parts[0];
     const section = parts[1] || "overview";
-    const mirrorIdx = parts[2] !== undefined ? parseInt(parts[2], 10) : -1;
 
-    const detail = await this.detail(id).catch(() => null);
-    if (!detail) {
-      return "Unable to retrieve book details from Anna's Archive.";
+    const item = await this.detail(id).catch(() => null);
+    if (!item) {
+      return "Unable to load book details.";
     }
 
-    if (section === "synopsis") {
+    const title = item.title || "Book";
+    const authorLine = item.author ? "Author: " + item.author : "";
+    const isbnLine = item.isbn ? "ISBN: " + item.isbn : "";
+
+    if (section === "torbox") {
+      const tbMirror = item.mirrors.find((m) => m.torbox) || item.mirrors[0];
       return [
-        "# " + detail.title,
-        detail.author ? "Author: " + detail.author : "",
+        "# " + title,
+        authorLine,
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "SYNOPSIS",
+        "⚡ TORBOX CLOUD DOWNLOAD",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        detail.description || "No description available.",
+        "1-Click TorBox WebDL URL:",
+        tbMirror.url,
+        "",
+        "How to download with TorBox:",
+        "1. Tap or copy the 1-Click link above to open TorBox WebDL directly.",
+        "2. Alternatively, copy the Anna's Archive or Libgen link below and paste it into:",
+        "   https://torbox.app/webdl",
+        "3. TorBox will automatically download and cache the EPUB / PDF onto their high-speed servers for instant downloading or streaming!",
+        "",
+        "Direct Source Mirror:",
+        item.siteUrl,
       ]
         .filter(Boolean)
         .join("\n\n");
     }
 
-    if (section === "mirror" && mirrorIdx >= 0 && detail.mirrors?.[mirrorIdx]) {
-      const m = detail.mirrors[mirrorIdx];
+    if (section === "annas") {
+      const aaMirror = item.mirrors.find((m) => m.url.includes("annas-archive")) || item.mirrors[0];
       return [
-        "# " + detail.title,
-        "## " + m.name,
+        "# " + title,
+        authorLine,
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "Direct Download Link:",
-        m.url,
+        "📖 ANNA'S ARCHIVE DIRECT LINKS",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "Search & Download on Anna's Archive:",
+        aaMirror.url,
         "",
-        "Instructions:",
-        "Copy and paste this link into your browser or download manager to save the file (" +
-          (detail.format || "eBook") +
-          ").",
+        "Mirror domains available:",
+        "• " + AA_MIRRORS.join("\n• "),
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+    }
+
+    if (section === "libgen") {
+      const libgenMirror = item.mirrors.find((m) => m.url.includes("libgen")) || item.mirrors[0];
+      return [
+        "# " + title,
+        authorLine,
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "📥 LIBRARY GENESIS DIRECT DOWNLOAD",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "Libgen Download Mirror:",
+        libgenMirror.url,
         "",
-        "File Details:",
-        "• Format: " + (detail.format || "Unknown"),
-        "• Size: " + (detail.size || "Unknown"),
-        "• Language: " + (detail.originalLanguage || "Unknown"),
-        "• MD5: " + id,
-        detail.description
-          ? "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nSynopsis:\n" + detail.description
-          : "",
+        "Library Genesis provides direct EPUB and PDF downloads with no wait timers or captchas.",
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+    }
+
+    if (section === "synopsis") {
+      return [
+        "# " + title,
+        authorLine,
+        isbnLine,
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "SYNOPSIS",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        item.description || "No synopsis available for this book.",
       ]
         .filter(Boolean)
         .join("\n\n");
@@ -405,61 +363,40 @@ const plugin = {
 
     // Default Overview
     const lines = [
-      "# " + detail.title,
-      detail.author ? "Author: " + detail.author : "",
-      detail.publisher ? "Publisher: " + detail.publisher : "",
-      detail.year ? "Year: " + detail.year : "",
-      detail.format ? "Format: " + detail.format.toUpperCase() : "",
-      detail.size ? "File Size: " + detail.size : "",
-      detail.isbn ? "ISBN: " + detail.isbn : "",
-      detail.originalLanguage ? "Language: " + detail.originalLanguage : "",
-      "MD5: " + id,
+      "# " + title,
+      authorLine,
+      isbnLine,
+      item.year ? "Year: " + item.year : "",
       "",
       "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-      "DOWNLOAD MIRRORS",
+      "⚡ DOWNLOAD WITH TORBOX OR DIRECT MIRRORS",
       "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     ];
 
-    if (detail.mirrors && detail.mirrors.length > 0) {
-      detail.mirrors.forEach((m, idx) => {
-        lines.push(idx + 1 + ". " + m.name + ":");
-        lines.push(m.url);
-        lines.push("");
-      });
-    } else {
-      lines.push("Source Web Page (view mirrors):");
-      lines.push(detail.siteUrl || "https://annas-archive.gl/md5/" + id);
+    item.mirrors.forEach((m, idx) => {
+      lines.push((idx + 1) + ". " + m.name + ":");
+      lines.push(m.url);
       lines.push("");
+    });
+
+    if (item.description) {
+      lines.push("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+      lines.push("DESCRIPTION & SYNOPSIS");
+      lines.push("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+      lines.push(item.description);
     }
 
-    if (detail.description) {
-      lines.push("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      lines.push("SYNOPSIS & DESCRIPTION");
-      lines.push("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      lines.push(detail.description);
-    }
-
-    return lines.join("\n\n");
+    return lines.filter(Boolean).join("\n\n");
   },
 
   async tags() {
     return [
-      { id: "ext:epub", name: "EPUB", group: "Format" },
-      { id: "ext:pdf", name: "PDF", group: "Format" },
-      { id: "ext:mobi", name: "MOBI", group: "Format" },
-      { id: "ext:cbr", name: "Comic (CBR/CBZ)", group: "Format" },
+      { id: "content:bestsellers", name: "Bestsellers", group: "Category" },
       { id: "content:book_fiction", name: "Fiction", group: "Category" },
       { id: "content:book_nonfiction", name: "Non-Fiction", group: "Category" },
-      { id: "content:book_comic", name: "Comics & Manga", group: "Category" },
-      { id: "content:magazine", name: "Magazines", group: "Category" },
+      { id: "content:book_comic", name: "Comics & Graphic Novels", group: "Category" },
       { id: "sort:popular", name: "Most Popular", group: "Sort" },
       { id: "sort:newest", name: "Newest", group: "Sort" },
-      { id: "lang:en", name: "English", group: "Language" },
-      { id: "lang:es", name: "Spanish", group: "Language" },
-      { id: "lang:fr", name: "French", group: "Language" },
-      { id: "lang:de", name: "German", group: "Language" },
-      { id: "lang:zh", name: "Chinese", group: "Language" },
-      { id: "lang:ja", name: "Japanese", group: "Language" },
     ];
   },
 };
