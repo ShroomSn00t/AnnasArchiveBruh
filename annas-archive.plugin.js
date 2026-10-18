@@ -1,14 +1,12 @@
 // Compass & Harbor eBook Source Plugin: Anna's Archive & Shadow Libraries
 //
 // 1-Click in-app reader: Downloads & unzips EPUB files directly into Compass,
-// extracting chapters and story text. Integrates TorBox WebDL API + Open & Shadow Libraries.
+// extracting real chapters and story prose. Integrates TorBox WebDL + Open & Shadow Libraries.
 
 // =============================================================================
-// 🔑 TORBOX API KEY CONFIGURATION
-// Paste your TorBox API key below (get it from https://torbox.app/settings)
-// to unlock automatic 1-click downloading & reading of all shadow library books!
+// 🔑 TORBOX API KEY CONFIGURATION (Hardcoded for user)
 // =============================================================================
-const TORBOX_API_KEY = "";
+const TORBOX_API_KEY = "265cd0c5-9953-4505-b9cc-0fc071c58b67";
 
 const bridge =
   typeof compass !== "undefined"
@@ -16,14 +14,6 @@ const bridge =
     : typeof harbor !== "undefined"
       ? harbor
       : (typeof globalThis !== "undefined" ? (globalThis.compass || globalThis.harbor) : null);
-
-const AA_MIRRORS = [
-  "https://annas-archive.gl",
-  "https://annas-archive.pk",
-  "https://annas-archive.gd",
-  "https://annas-archive.li",
-  "https://annas-archive.org",
-];
 
 const HEADERS = {
   "User-Agent":
@@ -212,10 +202,9 @@ function parseEpubChapters(entries) {
 // Request direct CDN download URL from TorBox WebDL API
 async function downloadViaTorbox(targetUrl) {
   const apiKey = TORBOX_API_KEY;
-  if (!apiKey) return null;
+  if (!apiKey || !bridge) return null;
 
   try {
-    // 1. Submit download request to TorBox
     const createRes = await bridge.http("https://api.torbox.app/v1/api/webdl/createwebdownload", {
       method: "POST",
       headers: {
@@ -229,10 +218,9 @@ async function downloadViaTorbox(targetUrl) {
     });
 
     const body = createRes?.body || createRes;
-    const webId = body?.data?.id || body?.data?.web_id;
+    const webId = body?.data?.webdownload_id || body?.data?.id || body?.data?.web_id;
     if (!webId) return null;
 
-    // 2. Fetch direct CDN link
     const dlRes = await bridge.http(
       "https://api.torbox.app/v1/api/webdl/requestdl?token=" +
         apiKey +
@@ -254,8 +242,94 @@ async function downloadViaTorbox(targetUrl) {
   }
 }
 
+// Direct Shadow Library / Libgen EPUB Resolver & Downloader
+async function downloadViaLibgen(query) {
+  if (!bridge) return null;
+  try {
+    const searchUrl =
+      "https://libgen.li/index.php?req=" + encodeURIComponent(query) + "&res=25";
+    const searchRes = await bridge.http(searchUrl, {
+      method: "GET",
+      headers: HEADERS,
+      responseType: "text",
+      timeoutMs: 15000,
+    });
+
+    const html = searchRes?.body || (typeof searchRes === "string" ? searchRes : "");
+    if (!html) return null;
+
+    // Find ads.php?md5=... candidate links
+    const md5Regex = /ads\.php\?md5=([a-f0-9]{32})/gi;
+    let m;
+    const md5s = [];
+    while ((m = md5Regex.exec(html)) !== null) {
+      if (!md5s.includes(m[1])) md5s.push(m[1]);
+    }
+    if (md5s.length === 0) return null;
+
+    // Try top 2 candidates
+    for (const md5 of md5s.slice(0, 2)) {
+      const adsUrl = "https://libgen.li/ads.php?md5=" + md5;
+      const adsRes = await bridge.http(adsUrl, {
+        method: "GET",
+        headers: {
+          ...HEADERS,
+          Referer: searchUrl,
+        },
+        responseType: "text",
+        timeoutMs: 15000,
+      });
+
+      const adsHtml = adsRes?.body || (typeof adsRes === "string" ? adsRes : "");
+      if (!adsHtml) continue;
+
+      const getMatch = adsHtml.match(/href=["'](get\.php\?[^"']+)["']/i);
+      if (!getMatch) continue;
+
+      const getUrl = "https://libgen.li/" + getMatch[1];
+
+      // Download EPUB binary via base64
+      let fileRes = await bridge.http(getUrl, {
+        method: "GET",
+        headers: {
+          ...HEADERS,
+          Referer: adsUrl,
+        },
+        responseType: "base64",
+        timeoutMs: 30000,
+      });
+
+      // If redirect header was provided without auto-follow:
+      if (fileRes && fileRes.status >= 300 && fileRes.status < 400) {
+        const nextUrl = fileRes.headers?.location || fileRes.headers?.Location;
+        if (nextUrl) {
+          const directUrl = nextUrl.startsWith("http") ? nextUrl : "https://libgen.li/" + nextUrl;
+          fileRes = await bridge.http(directUrl, {
+            method: "GET",
+            headers: HEADERS,
+            responseType: "base64",
+            timeoutMs: 30000,
+          });
+        }
+      }
+
+      if (fileRes && fileRes.body && fileRes.body.length > 500) {
+        const bytes = base64ToBytes(fileRes.body);
+        // Verify ZIP magic bytes 'PK\x03\x04'
+        if (bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04) {
+          return bytes;
+        }
+      }
+    }
+  } catch (e) {
+    // Continue to next resolver
+  }
+  return null;
+}
+
 // Safe OpenLibrary JSON search
 async function queryOpenLibrary(path) {
+  if (!bridge) return null;
   try {
     const res = await bridge.http("https://openlibrary.org" + path, {
       method: "GET",
@@ -425,6 +499,7 @@ const plugin = {
         id: id + "::" + encodeURIComponent(c.path),
         title: c.title,
         position: c.position,
+        language: "en",
       }));
     }
 
@@ -443,58 +518,64 @@ const plugin = {
     }
     if (!title) title = id;
 
-    // 2. Candidate download URLs for the EPUB
-    const candidates = [];
-
-    // Gutenberg / Internet Archive direct public mirror
-    if (iaId) {
-      candidates.push("https://archive.org/download/" + iaId + "/" + iaId + ".epub");
-    }
-
-    // Direct Anna's Archive search URL for TorBox
-    const query = isbn || title;
-    candidates.push("https://annas-archive.gl/search?q=" + encodeURIComponent(query));
-    candidates.push("https://libgen.li/index.php?req=" + encodeURIComponent(query));
-
-    // 3. Attempt downloading the EPUB
     let epubBytes = null;
 
-    // A) If TorBox API key is provided, use TorBox high-speed WebDL
-    if (TORBOX_API_KEY) {
-      for (const target of candidates) {
-        const torboxCdnUrl = await downloadViaTorbox(target);
-        if (torboxCdnUrl) {
-          const res = await bridge.http(torboxCdnUrl, {
+    // Stage 1: Try Libgen Shadow Library direct download (fastest & highest hit-rate for modern books)
+    const searchQuery = isbn || title;
+    epubBytes = await downloadViaLibgen(searchQuery);
+
+    // Stage 2: If not found and iaId exists, try TorBox WebDL or direct Internet Archive
+    if (!epubBytes && iaId) {
+      if (TORBOX_API_KEY) {
+        const torboxUrl = await downloadViaTorbox("https://archive.org/details/" + iaId);
+        if (torboxUrl) {
+          const res = await bridge.http(torboxUrl, {
             method: "GET",
             headers: HEADERS,
             responseType: "base64",
             timeoutMs: 30000,
           });
-          if (res && res.ok && res.body) {
+          if (res && res.body && res.body.length > 500) {
             epubBytes = base64ToBytes(res.body);
-            break;
           }
         }
       }
+
+      // Direct public Internet Archive download
+      if (!epubBytes) {
+        try {
+          const iaUrl = "https://archive.org/download/" + iaId + "/" + iaId + ".epub";
+          const res = await bridge.http(iaUrl, {
+            method: "GET",
+            headers: HEADERS,
+            responseType: "base64",
+            timeoutMs: 25000,
+          });
+          if (res && res.body && res.body.length > 500) {
+            epubBytes = base64ToBytes(res.body);
+          }
+        } catch {}
+      }
     }
 
-    // B) Direct public download attempt (Internet Archive or open mirrors)
-    if (!epubBytes && iaId) {
+    // Stage 3: If still not found, try title search on Gutenberg mirror
+    if (!epubBytes) {
       try {
-        const iaUrl = "https://archive.org/download/" + iaId + "/" + iaId + ".epub";
-        const res = await bridge.http(iaUrl, {
-          method: "GET",
-          headers: HEADERS,
-          responseType: "base64",
-          timeoutMs: 25000,
-        });
-        if (res && res.ok && res.body) {
-          epubBytes = base64ToBytes(res.body);
+        const gutenbergUrl = "https://www.gutenberg.org/ebooks/search/?query=" + encodeURIComponent(title);
+        const gRes = await bridge.http(gutenbergUrl, { method: "GET", headers: HEADERS, responseType: "text" });
+        const gHtml = gRes?.body || "";
+        const bookIdMatch = gHtml.match(/\/ebooks\/(\d+)/);
+        if (bookIdMatch) {
+          const gEpubUrl = "https://www.gutenberg.org/ebooks/" + bookIdMatch[1] + ".epub.images";
+          const epubRes = await bridge.http(gEpubUrl, { method: "GET", headers: HEADERS, responseType: "base64" });
+          if (epubRes && epubRes.body && epubRes.body.length > 500) {
+            epubBytes = base64ToBytes(epubRes.body);
+          }
         }
       } catch {}
     }
 
-    // 4. If EPUB was successfully downloaded, unzip and parse into REAL chapters!
+    // If EPUB was successfully downloaded, unzip and parse into REAL chapters!
     if (epubBytes && epubBytes.length > 500) {
       try {
         const entries = await unzipEntries(epubBytes);
@@ -505,6 +586,7 @@ const plugin = {
             id: id + "::" + encodeURIComponent(c.path),
             title: c.title,
             position: c.position,
+            language: "en",
           }));
         }
       } catch (err) {
@@ -512,32 +594,19 @@ const plugin = {
       }
     }
 
-    // 5. If TorBox API key is missing or file requires TorBox activation
-    if (!TORBOX_API_KEY) {
-      return [
-        {
-          id: id + "::setup_torbox",
-          title: "🔑 Set TorBox API Key to unlock 1-Click Reading",
-          position: 0,
-        },
-        {
-          id: id + "::mirrors",
-          title: "📥 Open Anna's Archive Download Mirrors",
-          position: 1,
-        },
-      ];
-    }
-
+    // If completely unavailable, show informative fallback buttons
     return [
       {
-        id: id + "::loading_error",
-        title: "⚠️ Downloading book... Tap to retry",
+        id: id + "::retry",
+        title: "🔄 Book is preparing... Tap to reload chapters",
         position: 0,
+        language: "en",
       },
       {
         id: id + "::mirrors",
         title: "📥 Open Anna's Archive Download Mirrors",
         position: 1,
+        language: "en",
       },
     ];
   },
@@ -547,6 +616,11 @@ const plugin = {
     const bookId = parts[0];
     const subPath = parts[1] ? decodeURIComponent(parts[1]) : "";
 
+    // If cache was lost, trigger chapters() to re-download & unzip into cache
+    if (!epubCache.has(bookId)) {
+      await this.chapters(bookId);
+    }
+
     // 1. If this is a real chapter from the unzipped EPUB:
     if (epubCache.has(bookId)) {
       const { entries } = epubCache.get(bookId);
@@ -554,49 +628,31 @@ const plugin = {
       if (chapterBytes) {
         const decoder = new TextDecoder();
         const html = decoder.decode(chapterBytes);
-        const doc = await bridge.parseHtml(html);
-
-        if (doc) {
-          const blocks = doc.querySelectorAll("p, blockquote, div.para, h1, h2, h3, h4, li");
-          if (blocks && blocks.length > 0) {
-            const text = blocks
-              .map((b) => b.text().trim())
-              .filter(Boolean)
-              .join("\n\n");
-            if (text.length > 20) return text;
+        if (bridge && typeof bridge.parseHtml === "function") {
+          const doc = await bridge.parseHtml(html);
+          if (doc) {
+            const blocks = doc.querySelectorAll("p, blockquote, div.para, h1, h2, h3, h4, li");
+            if (blocks && blocks.length > 0) {
+              const text = blocks
+                .map((b) => b.text().trim())
+                .filter(Boolean)
+                .join("\n\n");
+              if (text.length > 20) return text;
+            }
           }
         }
 
-        // Fallback: strip tags
-        const stripped = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "")
+        // Tag stripping fallback
+        return html
+          .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "")
           .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, "")
           .replace(/<[^>]+>/g, " ")
           .replace(/\s+/g, " ")
           .trim();
-        return stripped;
       }
     }
 
-    // 2. If TorBox API key setup is needed:
-    if (subPath === "setup_torbox") {
-      return [
-        "# ⚡ Unlock 1-Click Reading in Compass with TorBox",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "To read protected books directly in Compass with 1-click, connect your TorBox API key:",
-        "",
-        "1. Go to: https://torbox.app/settings",
-        "2. Copy your API Key.",
-        "3. Open your plugin file:",
-        "   d:\\Programming\\AnnasArchiveBruh\\annas-archive.plugin.js",
-        "4. Paste your key into line 9:",
-        "   const TORBOX_API_KEY = \"your_api_key_here\";",
-        "5. Save the file and push to GitHub (or paste into your local repo).",
-        "",
-        "Once your API key is pasted, Compass will automatically download, unzip, and display all chapters (Chapter 1, Chapter 2, etc.) so you can read any book in 1-click!",
-      ].join("\n");
-    }
-
-    // 3. Fallback mirrors
+    // 2. Fallback info
     const detail = await this.detail(bookId);
     return [
       "# " + (detail.title || "Book"),
