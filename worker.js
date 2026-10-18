@@ -207,13 +207,25 @@ function cleanHtmlToProse(html) {
   return text;
 }
 
+async function safeFetch(url, options = {}, timeoutMs = 4000) {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(timer);
+    return res;
+  } catch {
+    return null;
+  }
+}
+
 // Resolver: Download EPUB from Libgen / Shadow Library
 async function fetchEpubFromLibgen(query) {
   try {
     const searchUrl =
       "https://libgen.li/index.php?req=" + encodeURIComponent(query) + "&res=25";
-    const res = await fetch(searchUrl, { headers: HEADERS });
-    if (!res.ok) return null;
+    const res = await safeFetch(searchUrl, { headers: HEADERS }, 3500);
+    if (!res || !res.ok) return null;
     const html = await res.text();
 
     const md5Regex = /ads\.php\?md5=([a-f0-9]{32})/gi;
@@ -224,34 +236,33 @@ async function fetchEpubFromLibgen(query) {
     }
     if (md5s.length === 0) return null;
 
-    for (const md5 of md5s.slice(0, 3)) {
+    for (const md5 of md5s.slice(0, 2)) {
       const adsUrl = "https://libgen.li/ads.php?md5=" + md5;
-      const adsRes = await fetch(adsUrl, {
+      const adsRes = await safeFetch(adsUrl, {
         headers: { ...HEADERS, Referer: searchUrl },
-      });
-      if (!adsRes.ok) continue;
+      }, 3500);
+      if (!adsRes || !adsRes.ok) continue;
       const adsHtml = await adsRes.text();
 
       const getMatch = adsHtml.match(/href=["'](get\.php\?[^"']+)["']/i);
       if (!getMatch) continue;
 
       const getUrl = "https://libgen.li/" + getMatch[1];
-      const fileRes = await fetch(getUrl, {
+      const fileRes = await safeFetch(getUrl, {
         headers: { ...HEADERS, Referer: adsUrl },
         redirect: "follow",
-      });
+      }, 6000);
 
-      if (fileRes.ok) {
+      if (fileRes && fileRes.ok) {
         const ab = await fileRes.arrayBuffer();
         const bytes = new Uint8Array(ab);
-        // Verify ZIP magic bytes
         if (bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04) {
           return bytes;
         }
       }
     }
   } catch (e) {
-    console.error("Libgen fetch error:", e);
+    // Continue to next resolver
   }
   return null;
 }
@@ -260,7 +271,7 @@ async function fetchEpubFromLibgen(query) {
 async function fetchEpubViaTorbox(targetUrl) {
   if (!TORBOX_API_KEY) return null;
   try {
-    const createRes = await fetch("https://api.torbox.app/v1/api/webdl/createwebdownload", {
+    const createRes = await safeFetch("https://api.torbox.app/v1/api/webdl/createwebdownload", {
       method: "POST",
       headers: {
         Authorization: "Bearer " + TORBOX_API_KEY,
@@ -268,63 +279,69 @@ async function fetchEpubViaTorbox(targetUrl) {
         ...HEADERS,
       },
       body: "link=" + encodeURIComponent(targetUrl),
-    });
+    }, 5000);
+    if (!createRes) return null;
     const body = await createRes.json();
     const webId = body?.data?.webdownload_id || body?.data?.id || body?.data?.web_id;
     if (!webId) return null;
 
-    const dlRes = await fetch(
+    const dlRes = await safeFetch(
       "https://api.torbox.app/v1/api/webdl/requestdl?token=" +
         TORBOX_API_KEY +
         "&web_id=" +
         webId +
         "&redirect=false",
-      { headers: HEADERS }
+      { headers: HEADERS },
+      5000
     );
+    if (!dlRes) return null;
     const dlBody = await dlRes.json();
     const cdnUrl = dlBody?.data?.url || dlBody?.url;
     if (!cdnUrl) return null;
 
-    const fileRes = await fetch(cdnUrl, { headers: HEADERS });
-    if (fileRes.ok) {
+    const fileRes = await safeFetch(cdnUrl, { headers: HEADERS }, 10000);
+    if (fileRes && fileRes.ok) {
       const bytes = new Uint8Array(await fileRes.arrayBuffer());
       if (bytes[0] === 0x50 && bytes[1] === 0x4b) return bytes;
     }
   } catch (e) {
-    console.error("TorBox fetch error:", e);
+    // Continue to next resolver
   }
   return null;
 }
 
 // Resolver: Download via Internet Archive / Gutenberg
 async function fetchEpubOpen(iaId, title) {
+  if (title) {
+    try {
+      const gUrl = "https://www.gutenberg.org/ebooks/search/?query=" + encodeURIComponent(title);
+      const res = await safeFetch(gUrl, { headers: HEADERS }, 3500);
+      if (res && res.ok) {
+        const html = await res.text();
+        const m = html.match(/\/ebooks\/(\d+)/);
+        if (m) {
+          const dl = "https://www.gutenberg.org/ebooks/" + m[1] + ".epub.images";
+          const f = await safeFetch(dl, { headers: HEADERS, redirect: "follow" }, 6000);
+          if (f && f.ok) {
+            const bytes = new Uint8Array(await f.arrayBuffer());
+            if (bytes[0] === 0x50 && bytes[1] === 0x4b) return bytes;
+          }
+        }
+      }
+    } catch {}
+  }
+
   if (iaId) {
     try {
       const iaUrl = "https://archive.org/download/" + iaId + "/" + iaId + ".epub";
-      const res = await fetch(iaUrl, { headers: HEADERS, redirect: "follow" });
-      if (res.ok) {
+      const res = await safeFetch(iaUrl, { headers: HEADERS, redirect: "follow" }, 5000);
+      if (res && res.ok) {
         const bytes = new Uint8Array(await res.arrayBuffer());
         if (bytes[0] === 0x50 && bytes[1] === 0x4b) return bytes;
       }
     } catch {}
   }
 
-  if (title) {
-    try {
-      const gUrl = "https://www.gutenberg.org/ebooks/search/?query=" + encodeURIComponent(title);
-      const res = await fetch(gUrl, { headers: HEADERS });
-      const html = await res.text();
-      const m = html.match(/\/ebooks\/(\d+)/);
-      if (m) {
-        const dl = "https://www.gutenberg.org/ebooks/" + m[1] + ".epub.images";
-        const f = await fetch(dl, { headers: HEADERS, redirect: "follow" });
-        if (f.ok) {
-          const bytes = new Uint8Array(await f.arrayBuffer());
-          if (bytes[0] === 0x50 && bytes[1] === 0x4b) return bytes;
-        }
-      }
-    } catch {}
-  }
   return null;
 }
 
@@ -335,8 +352,16 @@ async function getOrLoadBook(bookKey, title, isbn, iaId) {
   }
 
   const query = isbn || title || bookKey;
-  let epubBytes = await fetchEpubFromLibgen(query);
 
+  // Try Open sources first (blazing fast, sub-second)
+  let epubBytes = await fetchEpubOpen(iaId, title);
+
+  // Next try Libgen Shadow Library
+  if (!epubBytes) {
+    epubBytes = await fetchEpubFromLibgen(query);
+  }
+
+  // Next try TorBox WebDL
   if (!epubBytes && iaId && TORBOX_API_KEY) {
     epubBytes = await fetchEpubViaTorbox("https://archive.org/details/" + iaId);
   }

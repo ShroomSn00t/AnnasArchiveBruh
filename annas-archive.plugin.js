@@ -12,7 +12,7 @@ const TORBOX_API_KEY = "265cd0c5-9953-4505-b9cc-0fc071c58b67";
 // Serverless / Local Reader Bridge URL (Default: localhost:3000 or your Cloudflare Worker)
 // Set this to your deployed Cloudflare Worker URL (e.g., https://your-worker.workers.dev)
 // to read from ANY device (mobile, tablet, PC).
-const BRIDGE_URL = "http://localhost:3000";
+const BRIDGE_URL = "https://annas-archive-bridge.officialneohack.workers.dev";
 
 const bridge =
   typeof compass !== "undefined"
