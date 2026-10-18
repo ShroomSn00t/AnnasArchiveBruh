@@ -269,7 +269,7 @@ const plugin = {
       year,
       originalLanguage: "en",
       genres: ["eBook", "Anna's Archive"],
-      siteUrl: "https://annas-archive.gl/search?q=" + encodeURIComponent(isbn || title),
+      siteUrl: "https://annas-archive.pk/search?q=" + encodeURIComponent(isbn || title),
     };
   },
 
@@ -448,15 +448,19 @@ const plugin = {
 
     // 4. Fallback mirrors
     const detail = await this.detail(bookId);
+    const searchParam = encodeURIComponent(detail.isbn || detail.title);
     return [
       "# " + (detail.title || "Book"),
       detail.author ? "Author: " + detail.author : "",
       "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-      "Anna's Archive Mirror Page:",
-      detail.siteUrl,
+      "Active Anna's Archive Mirrors (from open-slum.org):",
+      "• https://annas-archive.pk/search?q=" + searchParam,
+      "• https://annas-archive.gd/search?q=" + searchParam,
+      "• https://libgen.li/index.php?req=" + searchParam,
+      "• Live Mirror Uptime: https://open-slum.org/annas.html",
       "",
       "TorBox WebDL URL:",
-      "https://torbox.app/webdl?url=" + encodeURIComponent(detail.siteUrl),
+      "https://torbox.app/webdl?url=" + encodeURIComponent("https://annas-archive.pk/search?q=" + searchParam),
     ]
       .filter(Boolean)
       .join("\n\n");

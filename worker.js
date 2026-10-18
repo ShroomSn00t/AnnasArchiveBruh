@@ -506,54 +506,58 @@ async function fetchDirectIaEpub(iaId, title, author) {
   return null;
 }
 
-// Resolver: Download EPUB from Libgen / Shadow Library
+// Resolver: Download EPUB from Libgen / Shadow Library (multi-mirror from open-slum.org)
 async function fetchEpubFromLibgen(query) {
-  try {
-    const searchUrl =
-      "https://libgen.li/index.php?req=" +
-      encodeURIComponent(query) +
-      "&columns%5B%5D=t&columns%5B%5D=a&extension%5B%5D=epub";
-    const res = await safeFetch(searchUrl, { headers: HEADERS }, 4000);
-    if (!res || !res.ok) return null;
-    const html = await res.text();
+  const mirrors = ["https://libgen.li", "https://libgen.bz"];
+  for (const mirror of mirrors) {
+    try {
+      const searchUrl =
+        mirror +
+        "/index.php?req=" +
+        encodeURIComponent(query) +
+        "&columns%5B%5D=t&columns%5B%5D=a&extension%5B%5D=epub";
+      const res = await safeFetch(searchUrl, { headers: HEADERS }, 4000);
+      if (!res || !res.ok) continue;
+      const html = await res.text();
 
-    const md5Regex = /ads\.php\?md5=([a-f0-9]{32})/gi;
-    let m;
-    const md5s = [];
-    while ((m = md5Regex.exec(html)) !== null) {
-      if (!md5s.includes(m[1])) md5s.push(m[1]);
-    }
-    if (md5s.length === 0) return null;
+      const md5Regex = /ads\.php\?md5=([a-f0-9]{32})/gi;
+      let m;
+      const md5s = [];
+      while ((m = md5Regex.exec(html)) !== null) {
+        if (!md5s.includes(m[1])) md5s.push(m[1]);
+      }
+      if (md5s.length === 0) continue;
 
-    for (const md5 of md5s.slice(0, 2)) {
-      const adsUrl = "https://libgen.li/ads.php?md5=" + md5;
-      const adsRes = await safeFetch(
-        adsUrl,
-        { headers: { ...HEADERS, Referer: searchUrl } },
-        3500
-      );
-      if (!adsRes || !adsRes.ok) continue;
-      const adsHtml = await adsRes.text();
+      for (const md5 of md5s.slice(0, 2)) {
+        const adsUrl = mirror + "/ads.php?md5=" + md5;
+        const adsRes = await safeFetch(
+          adsUrl,
+          { headers: { ...HEADERS, Referer: searchUrl } },
+          3500
+        );
+        if (!adsRes || !adsRes.ok) continue;
+        const adsHtml = await adsRes.text();
 
-      const getMatch = adsHtml.match(/href=["'](get\.php\?[^"']+)["']/i);
-      if (!getMatch) continue;
+        const getMatch = adsHtml.match(/href=["'](get\.php\?[^"']+)["']/i);
+        if (!getMatch) continue;
 
-      const getUrl = "https://libgen.li/" + getMatch[1];
-      const fileRes = await safeFetch(
-        getUrl,
-        { headers: { ...HEADERS, Referer: adsUrl }, redirect: "follow" },
-        6000
-      );
+        const getUrl = mirror + "/" + getMatch[1];
+        const fileRes = await safeFetch(
+          getUrl,
+          { headers: { ...HEADERS, Referer: adsUrl }, redirect: "follow" },
+          6000
+        );
 
-      if (fileRes && fileRes.ok) {
-        const ab = await fileRes.arrayBuffer();
-        const bytes = new Uint8Array(ab);
-        if (bytes[0] === 0x50 && bytes[1] === 0x4b) {
-          return bytes;
+        if (fileRes && fileRes.ok) {
+          const ab = await fileRes.arrayBuffer();
+          const bytes = new Uint8Array(ab);
+          if (bytes[0] === 0x50 && bytes[1] === 0x4b) {
+            return bytes;
+          }
         }
       }
-    }
-  } catch {}
+    } catch {}
+  }
   return null;
 }
 
